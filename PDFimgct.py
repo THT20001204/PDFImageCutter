@@ -419,127 +419,155 @@ class PDFImageProcessor:
                     f.write(f"  文件路径: {detail['file_path']}\n")
                     f.write(f"  不合格原因: {detail['reasons']}\n\n")
 
+    @staticmethod
+    def is_blank_image(img_bgr, blank_threshold=0.97):
+        """
+        检测图片是否几乎全空白（白色/接近白色）。
+        返回 True 表示是空白图，应被丢弃。
+        """
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        white_pixels = np.sum(gray > 240)
+        total_pixels = gray.shape[0] * gray.shape[1]
+        return (white_pixels / total_pixels) >= blank_threshold
+
+    @staticmethod
+    def merge_overlapping_boxes(boxes, overlap_thresh=0.3, gap_ratio=0.05, img_w=1, img_h=1):
+        """
+        合并重叠或相邻的边界框，防止同一张子图被切成碎片。
+        boxes: list of (x, y, w, h)
+        gap_ratio: 框之间距离小于图宽/高此比例时视为相邻并合并
+        """
+        if not boxes:
+            return []
+
+        rects = [list(b) for b in boxes]
+        gap_x = int(img_w * gap_ratio)
+        gap_y = int(img_h * gap_ratio)
+
+        merged = True
+        while merged:
+            merged = False
+            new_rects = []
+            used = [False] * len(rects)
+            for i in range(len(rects)):
+                if used[i]:
+                    continue
+                x1, y1, w1, h1 = rects[i]
+                for j in range(i + 1, len(rects)):
+                    if used[j]:
+                        continue
+                    x2, y2, w2, h2 = rects[j]
+
+                    # 两框是否重叠或足够接近
+                    if (x1 - gap_x <= x2 + w2 and x2 - gap_x <= x1 + w1 and
+                            y1 - gap_y <= y2 + h2 and y2 - gap_y <= y1 + h1):
+                        nx = min(x1, x2)
+                        ny = min(y1, y2)
+                        nx2 = max(x1 + w1, x2 + w2)
+                        ny2 = max(y1 + h1, y2 + h2)
+                        x1, y1, w1, h1 = nx, ny, nx2 - nx, ny2 - ny
+                        rects[i] = [x1, y1, w1, h1]
+                        used[j] = True
+                        merged = True
+
+                new_rects.append((x1, y1, w1, h1))
+            rects = new_rects
+
+        return rects
+
     def auto_detect_subimages(self, image_path, output_dir):
         """自动检测子图的数量和布局"""
         try:
-            # 使用PIL读取并确保RGB格式
             pil_img = Image.open(image_path).convert('RGB')
             img_array = np.array(pil_img)
-
-            # 转换为BGR格式给OpenCV使用
             img = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
-
-            # 创建输出目录
             os.makedirs(output_dir, exist_ok=True)
 
-            # 转换为灰度图
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            img_h, img_w = img.shape[:2]
+            img_area = img_h * img_w
 
-            # 尝试多种边缘检测方法
+            # 最小子图面积：至少占原图 3%
+            min_sub_area = img_area * 0.03
+            min_sub_w = img_w * 0.08
+            min_sub_h = img_h * 0.08
+
             methods = [
                 ('canny', cv2.Canny(gray, 50, 180)),
-                ('adaptive_thresh', cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                                          cv2.THRESH_BINARY_INV, 11, 2)),
-                ('otsu_thresh', cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1])
+                ('adaptive_thresh', cv2.adaptiveThreshold(
+                    gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                    cv2.THRESH_BINARY_INV, 11, 2)),
+                ('otsu_thresh', cv2.threshold(
+                    gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1])
             ]
 
-            best_contours = []
-            best_method = ""
-
+            best_boxes = []
             for method_name, edges in methods:
-                # 形态学操作增强边缘
-                kernel = np.ones((3, 3), np.uint8)
-                edges_cleaned = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=3)
+                kernel = np.ones((5, 5), np.uint8)
+                edges_cleaned = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=5)
 
-                # 查找轮廓
-                contours, _ = cv2.findContours(edges_cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                contours, _ = cv2.findContours(
+                    edges_cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-                # 过滤合理的轮廓
-                valid_contours = []
+                raw_boxes = []
                 for contour in contours:
-                    area = cv2.contourArea(contour)
                     x, y, w, h = cv2.boundingRect(contour)
+                    area = w * h
+                    if (area >= min_sub_area and area < img_area * 0.85
+                            and w >= min_sub_w and h >= min_sub_h
+                            and 0.15 < (w / h) < 7):
+                        raw_boxes.append((x, y, w, h))
 
-                    img_area = img.shape[0] * img.shape[1]
-                    if (area > img_area * 0.0002 and
-                            area < img_area * 0.8 and
-                            w > img.shape[1] * 0.03 and
-                            h > img.shape[0] * 0.03 and
-                            w / h > 0.3 and w / h < 10):
-                        valid_contours.append(contour)
+                merged = self.merge_overlapping_boxes(
+                    raw_boxes, gap_ratio=0.03, img_w=img_w, img_h=img_h)
 
-                if len(valid_contours) > len(best_contours):
-                    best_contours = valid_contours
-                    best_method = method_name
+                # 选产生 2-30 个合理子图的方案；更少碎片优先
+                if 2 <= len(merged) <= 30:
+                    if not best_boxes or len(merged) < len(best_boxes):
+                        best_boxes = merged
 
-            # 如果自动检测失败，使用投影分析
-            if len(best_contours) < 2:
+            if len(best_boxes) < 2:
                 return self.detect_grid_layout(image_path, output_dir)
 
-            # 计算所有子图的统计信息
-            widths = []
-            heights = []
-            areas = []
-            for contour in best_contours:
-                x, y, w, h = cv2.boundingRect(contour)
-                widths.append(w)
-                heights.append(h)
-                areas.append(w * h)
+            # 按面积中位数再过滤过小碎片
+            areas = [w * h for (_, _, w, h) in best_boxes]
+            median_area = np.median(areas)
 
-            median_width = np.median(widths) if widths else 0
-            median_height = np.median(heights) if heights else 0
-            median_area = np.median(areas) if areas else 0
-
-            # 根据轮廓提取子图
             success_count = 0
             split_details = []
 
-            for i, contour in enumerate(best_contours):
-                x, y, w, h = cv2.boundingRect(contour)
-                area = w * h
-
-                img_area = img.shape[0] * img.shape[1]
-                if (area < median_area * 0.25 or
-                        (w < median_width * 0.71 and h < median_height * 0.75) or
-                        area < img_area * 0.001):
+            for (x, y, w, h) in best_boxes:
+                if w * h < median_area * 0.20:
                     continue
 
-                # 添加边距
-                margin = 1
+                margin = 2
                 x = max(0, x - margin)
                 y = max(0, y - margin)
-                w = min(img.shape[1] - x, w + 2 * margin)
-                h = min(img.shape[0] - y, h + 2 * margin)
+                w = min(img_w - x, w + 2 * margin)
+                h = min(img_h - y, h + 2 * margin)
 
-                # 提取子图
                 sub_img = img[y:y + h, x:x + w]
+                if sub_img.size == 0 or self.is_blank_image(sub_img):
+                    continue
 
-                if sub_img.size > 0:
-                    # 标准化的子图文件名
-                    subimage_filename = f"subimage_{success_count + 1:04d}.png"
-                    output_path = os.path.join(output_dir, subimage_filename)
+                subimage_filename = f"subimage_{success_count + 1:04d}.png"
+                output_path = os.path.join(output_dir, subimage_filename)
 
-                    # 使用PIL保存
-                    sub_img_rgb = cv2.cvtColor(sub_img, cv2.COLOR_BGR2RGB)
-                    pil_sub_img = Image.fromarray(sub_img_rgb)
-                    pil_sub_img.save(output_path, "PNG")
+                sub_img_rgb = cv2.cvtColor(sub_img, cv2.COLOR_BGR2RGB)
+                Image.fromarray(sub_img_rgb).save(output_path, "PNG")
 
-                    # 计算百万像素
-                    megapixels = self.calculate_megapixels(w, h)
-
-                    split_details.append({
-                        'filename': subimage_filename,
-                        'original_image': os.path.basename(image_path),
-                        'position': f"({x}, {y})",
-                        'width': w,
-                        'height': h,
-                        'file_size': os.path.getsize(output_path),
-                        'megapixels': megapixels,
-                        'file_path': output_path,
-                        'split_status': 'success'
-                    })
-
-                    success_count += 1
+                megapixels = self.calculate_megapixels(w, h)
+                split_details.append({
+                    'filename': subimage_filename,
+                    'original_image': os.path.basename(image_path),
+                    'position': f"({x}, {y})",
+                    'width': w, 'height': h,
+                    'file_size': os.path.getsize(output_path),
+                    'megapixels': megapixels,
+                    'file_path': output_path,
+                    'split_status': 'success'
+                })
+                success_count += 1
 
             return success_count, split_details
 
@@ -553,43 +581,30 @@ class PDFImageProcessor:
             pil_img = Image.open(image_path).convert('RGB')
             img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            img_h, img_w = img.shape[:2]
 
             os.makedirs(output_dir, exist_ok=True)
 
-            # 二值化
             _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-            # 水平投影和垂直投影
             horizontal_projection = np.sum(binary, axis=1)
             vertical_projection = np.sum(binary, axis=0)
 
-            # 寻找行列分隔
-            row_boundaries = self.find_boundaries(horizontal_projection, min_gap=img.shape[0] // 20)
-            col_boundaries = self.find_boundaries(vertical_projection, min_gap=img.shape[1] // 20)
+            row_boundaries = self.find_boundaries(horizontal_projection, min_gap=img_h // 15)
+            col_boundaries = self.find_boundaries(vertical_projection, min_gap=img_w // 15)
 
-            # 至少要有2行2列
+            # 如果投影分析没有找到真实的行列分隔，不强制分割
+            if len(row_boundaries) < 3 and len(col_boundaries) < 3:
+                return 0, []
             if len(row_boundaries) < 3:
-                row_boundaries = [0, img.shape[0] // 2, img.shape[0]]
+                row_boundaries = [0, img_h]
             if len(col_boundaries) < 3:
-                col_boundaries = [0, img.shape[1] // 2, img.shape[1]]
+                col_boundaries = [0, img_w]
 
-            # 计算网格单元统计信息
-            cell_widths = []
-            cell_heights = []
-            cell_areas = []
-            for i in range(len(row_boundaries) - 1):
-                for j in range(len(col_boundaries) - 1):
-                    y1, y2 = row_boundaries[i], row_boundaries[i + 1]
-                    x1, x2 = col_boundaries[j], col_boundaries[j + 1]
-                    cell_widths.append(x2 - x1)
-                    cell_heights.append(y2 - y1)
-                    cell_areas.append((x2 - x1) * (y2 - y1))
+            min_cell_w = img_w * 0.08
+            min_cell_h = img_h * 0.08
+            min_cell_area = img_h * img_w * 0.03
 
-            median_cell_width = np.median(cell_widths) if cell_widths else 0
-            median_cell_height = np.median(cell_heights) if cell_heights else 0
-            median_cell_area = np.median(cell_areas) if cell_areas else 0
-
-            # 根据检测到的行列进行分割
             success_count = 0
             split_details = []
 
@@ -600,41 +615,33 @@ class PDFImageProcessor:
 
                     cell_width = x2 - x1
                     cell_height = y2 - y1
-                    cell_area = cell_width * cell_height
 
-                    # 筛选条件
-                    if (cell_area < median_cell_area * 0.25 or
-                            (cell_width < median_cell_width * 0.5 and cell_height < median_cell_height * 0.5) or
-                            cell_width < 100 or cell_height < 100):
+                    if (cell_width < min_cell_w or cell_height < min_cell_h
+                            or cell_width * cell_height < min_cell_area):
                         continue
 
                     sub_img = img[y1:y2, x1:x2]
+                    if sub_img.size == 0 or self.is_blank_image(sub_img):
+                        continue
 
-                    if sub_img.size > 0:
-                        # 标准化的网格子图文件名
-                        subimage_filename = f"grid_{i}_{j}.png"
-                        output_path = os.path.join(output_dir, subimage_filename)
+                    subimage_filename = f"grid_{i}_{j}.png"
+                    output_path = os.path.join(output_dir, subimage_filename)
 
-                        sub_img_rgb = cv2.cvtColor(sub_img, cv2.COLOR_BGR2RGB)
-                        pil_sub_img = Image.fromarray(sub_img_rgb)
-                        pil_sub_img.save(output_path, "PNG")
+                    sub_img_rgb = cv2.cvtColor(sub_img, cv2.COLOR_BGR2RGB)
+                    Image.fromarray(sub_img_rgb).save(output_path, "PNG")
 
-                        # 计算百万像素
-                        megapixels = self.calculate_megapixels(cell_width, cell_height)
-
-                        split_details.append({
-                            'filename': subimage_filename,
-                            'original_image': os.path.basename(image_path),
-                            'grid_position': f"({i}, {j})",
-                            'width': cell_width,
-                            'height': cell_height,
-                            'file_size': os.path.getsize(output_path),
-                            'megapixels': megapixels,
-                            'file_path': output_path,
-                            'split_status': 'success'
-                        })
-
-                        success_count += 1
+                    megapixels = self.calculate_megapixels(cell_width, cell_height)
+                    split_details.append({
+                        'filename': subimage_filename,
+                        'original_image': os.path.basename(image_path),
+                        'grid_position': f"({i}, {j})",
+                        'width': cell_width, 'height': cell_height,
+                        'file_size': os.path.getsize(output_path),
+                        'megapixels': megapixels,
+                        'file_path': output_path,
+                        'split_status': 'success'
+                    })
+                    success_count += 1
 
             return success_count, split_details
 
@@ -672,36 +679,37 @@ class PDFImageProcessor:
 
     def robust_auto_split(self, image_path, output_dir, failed_splits_dir):
         """
-        健壮的自动分割方法 - 结合多种检测方法
-        如果拆分失败，保存原图到失败目录
+        健壮的自动分割方法 - 结合多种检测方法。
+        优先选轮廓检测（已含框合并），投影分析作为补充。
+        不再盲目做固定网格切割，避免切碎完整图表。
         """
-        # 方法1: 自动轮廓检测
-        count1, details1 = self.auto_detect_subimages(image_path, output_dir + "_contour")
+        contour_dir = output_dir + "_contour"
+        projection_dir = output_dir + "_projection"
 
-        # 方法2: 投影分析
-        count2, details2 = self.detect_grid_layout(image_path, output_dir + "_projection")
+        try:
+            count1, details1 = self.auto_detect_subimages(image_path, contour_dir)
+            count2, details2 = self.detect_grid_layout(image_path, projection_dir)
 
-        # 选择最佳结果
-        if count1 >= count2 and count1 > 0:
-            # 复制最佳结果到主输出目录
-            if os.path.exists(output_dir):
-                shutil.rmtree(output_dir)
-            shutil.copytree(output_dir + "_contour", output_dir)
-            return count1, details1
-        elif count2 > 0:
-            # 复制最佳结果到主输出目录
-            if os.path.exists(output_dir):
-                shutil.rmtree(output_dir)
-            shutil.copytree(output_dir + "_projection", output_dir)
-            return count2, details2
-        else:
-            # 使用默认2x4网格分割
-            count3, details3 = self.manual_grid_split(image_path, output_dir, 2, 4)
-            if count3 > 0:
-                return count3, details3
-            else:
-                # 所有方法都失败，保存原图到失败目录
-                return self.save_original_as_fallback(image_path, output_dir, failed_splits_dir)
+            chosen_count, chosen_details, chosen_dir = 0, [], None
+
+            if count1 >= 2:
+                chosen_count, chosen_details, chosen_dir = count1, details1, contour_dir
+            elif count2 >= 2:
+                chosen_count, chosen_details, chosen_dir = count2, details2, projection_dir
+
+            if chosen_count >= 2 and chosen_dir:
+                if os.path.exists(output_dir):
+                    shutil.rmtree(output_dir)
+                shutil.copytree(chosen_dir, output_dir)
+                return chosen_count, chosen_details
+
+            # 所有自动方法都没有找到 >=2 个有效子图，保存原图
+            return self.save_original_as_fallback(image_path, output_dir, failed_splits_dir)
+
+        finally:
+            for tmp in (contour_dir, projection_dir):
+                if os.path.exists(tmp):
+                    shutil.rmtree(tmp, ignore_errors=True)
 
     def manual_grid_split(self, image_path, output_dir, rows, cols):
         """手动指定行列数的网格分割"""
@@ -737,7 +745,7 @@ class PDFImageProcessor:
 
                     sub_img = img[y1:y2, x1:x2]
 
-                    if sub_img.size > 0:
+                    if sub_img.size > 0 and not self.is_blank_image(sub_img):
 
                         subimage_filename = f"manual_{i}_{j}.png"
                         output_path = os.path.join(output_dir, subimage_filename)
