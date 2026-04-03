@@ -1,0 +1,23 @@
+# Virtual environments
+.venv*/
+venv*/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*~
+
+# OS metadata
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Output directories (processing results)
+processed_pdf_images/
+logs/

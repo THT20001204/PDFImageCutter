@@ -1,0 +1,6 @@
+PyMuPDF
+opencv-python
+numpy
+pandas
+Pillow
+tqdm

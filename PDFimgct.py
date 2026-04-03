@@ -1149,31 +1149,41 @@ def simple_complete_process(pdf_folder, output_base_folder="processed_pdf_images
 
 
 if __name__ == "__main__":
-    # 使用示例
-    pdf_folder = r"C:\Users\19191\Downloads\刘成下载\刘成下载\上线文章"  # 替换为你的PDF文件夹
-    output_folder = r"C:\Users\19191\Desktop\PDF完整处理"
+    import argparse
 
-    # 设置筛选条件
-    min_width = 50  # 最小宽度
-    min_height = 50  # 最小高度
-    min_area = 100  # 最小面积
-    max_aspect_ratio = 10  # 最大宽高比
-    min_file_size = 1024*5  # 最小文件大小 (5KB)
-    max_file_size = 100 * 1024 * 1024  # 最大文件大小 (50MB)
-    min_megapixels = 0.05  # 最小百万像素分辨率 (0.1MP = 10万像素)
+    parser = argparse.ArgumentParser(
+        description="从 PDF 中提取嵌入图片并自动拆分子图",
+    )
+    parser.add_argument("pdf_path", help="PDF 文件或文件夹路径")
+    parser.add_argument(
+        "-o", "--output",
+        default="processed_pdf_images",
+        help="输出文件夹 (默认: processed_pdf_images)",
+    )
+    parser.add_argument("--min-width", type=int, default=50, help="最小宽度，像素 (默认: 50)")
+    parser.add_argument("--min-height", type=int, default=50, help="最小高度，像素 (默认: 50)")
+    parser.add_argument("--min-area", type=int, default=100, help="最小面积，像素² (默认: 100)")
+    parser.add_argument("--max-aspect-ratio", type=float, default=10, help="最大宽高比 (默认: 10)")
+    parser.add_argument("--min-file-size", type=int, default=5120, help="最小文件大小，字节 (默认: 5120)")
+    parser.add_argument("--max-file-size", type=int, default=100*1024*1024, help="最大文件大小，字节 (默认: 100MB)")
+    parser.add_argument("--min-megapixels", type=float, default=0.05, help="最小百万像素 (默认: 0.05)")
+    parser.add_argument("--workers", type=int, default=4, help="并行工作线程数 (默认: 4)")
 
-    if os.path.exists(pdf_folder):
-        simple_complete_process(
-            pdf_folder,
-            output_folder,
-            min_width=min_width,
-            min_height=min_height,
-            min_area=min_area,
-            max_aspect_ratio=max_aspect_ratio,
-            min_file_size=min_file_size,
-            max_file_size=max_file_size,
-            min_megapixels=min_megapixels,
-            max_workers=4
-        )
-    else:
-        print(f"PDF文件夹不存在: {pdf_folder}")
+    args = parser.parse_args()
+
+    if not os.path.exists(args.pdf_path):
+        print(f"路径不存在: {args.pdf_path}")
+        exit(1)
+
+    simple_complete_process(
+        args.pdf_path,
+        args.output,
+        min_width=args.min_width,
+        min_height=args.min_height,
+        min_area=args.min_area,
+        max_aspect_ratio=args.max_aspect_ratio,
+        min_file_size=args.min_file_size,
+        max_file_size=args.max_file_size,
+        min_megapixels=args.min_megapixels,
+        max_workers=args.workers,
+    )
