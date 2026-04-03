@@ -18,7 +18,8 @@ class PDFImageProcessor:
 
     def __init__(self, base_output_folder="processed_pdf_images",
                  min_width=100, min_height=100, min_area=10000, max_aspect_ratio=10,
-                 min_file_size=1024, max_file_size=50 * 1024 * 1024, min_megapixels=0.1):
+                 min_file_size=1024, max_file_size=50 * 1024 * 1024, min_megapixels=0.1,
+                 ai_provider=None, ai_api_key=None, ai_model=None, ai_base_url=None):
         """
         初始化处理器
 
@@ -31,6 +32,10 @@ class PDFImageProcessor:
             min_file_size: 最小文件大小（字节，默认1KB）
             max_file_size: 最大文件大小（字节，默认50MB）
             min_megapixels: 最小百万像素分辨率（默认0.1MP，即10万像素）
+            ai_provider: AI 供应商 (openai/claude/qwen/zhipu)，为 None 则纯 CV 模式
+            ai_api_key: AI API 密钥
+            ai_model: AI 模型名（可选，有默认值）
+            ai_base_url: AI API 地址（可选，有默认值）
         """
         self.base_output_folder = base_output_folder
         self.min_width = min_width
@@ -40,6 +45,17 @@ class PDFImageProcessor:
         self.min_file_size = min_file_size
         self.max_file_size = max_file_size
         self.min_megapixels = min_megapixels
+
+        self.ai_splitter = None
+        if ai_provider and ai_api_key:
+            from ai_splitter import AISplitter
+            self.ai_splitter = AISplitter(
+                provider=ai_provider,
+                api_key=ai_api_key,
+                model=ai_model,
+                base_url=ai_base_url,
+            )
+
         self.setup_logging()
 
     def setup_logging(self):
@@ -64,6 +80,10 @@ class PDFImageProcessor:
         self.logger.info(f"  宽高比: ≤ {self.max_aspect_ratio}")
         self.logger.info(f"  文件大小: {self.min_file_size / 1024:.1f}KB - {self.max_file_size / (1024 * 1024):.1f}MB")
         self.logger.info(f"  百万像素分辨率: ≥ {self.min_megapixels}MP")
+        if self.ai_splitter:
+            self.logger.info(f"  AI 拆分模式: {self.ai_splitter.provider} / {self.ai_splitter.model}")
+        else:
+            self.logger.info(f"  拆分模式: 纯 CV 算法")
 
     def find_pdf_files(self, input_path):
         """
@@ -677,12 +697,82 @@ class PDFImageProcessor:
 
         return boundaries
 
+    def ai_split_image(self, image_path, output_dir):
+        """
+        使用多模态 AI 检测子图并裁切。
+
+        Returns:
+            tuple: (count, details) 与 robust_auto_split 格式一致。
+                   count=0 表示 AI 认为是单一图片或调用失败。
+        """
+        try:
+            pil_img = Image.open(image_path).convert('RGB')
+            img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+            img_h, img_w = img.shape[:2]
+
+            subimages = self.ai_splitter.detect_subimages(image_path)
+            if not subimages:
+                return 0, []
+
+            os.makedirs(output_dir, exist_ok=True)
+            success_count = 0
+            split_details = []
+
+            for item in subimages:
+                x1_n, y1_n, x2_n, y2_n = item["bbox"]
+                x1 = max(0, int(x1_n * img_w))
+                y1 = max(0, int(y1_n * img_h))
+                x2 = min(img_w, int(x2_n * img_w))
+                y2 = min(img_h, int(y2_n * img_h))
+
+                w, h = x2 - x1, y2 - y1
+                if w < 20 or h < 20:
+                    continue
+
+                sub_img = img[y1:y2, x1:x2]
+                if sub_img.size == 0 or self.is_blank_image(sub_img):
+                    continue
+
+                subimage_filename = f"ai_sub_{success_count + 1:04d}.png"
+                output_path = os.path.join(output_dir, subimage_filename)
+
+                sub_img_rgb = cv2.cvtColor(sub_img, cv2.COLOR_BGR2RGB)
+                Image.fromarray(sub_img_rgb).save(output_path, "PNG")
+
+                megapixels = self.calculate_megapixels(w, h)
+                split_details.append({
+                    'filename': subimage_filename,
+                    'original_image': os.path.basename(image_path),
+                    'position': f"({x1}, {y1})",
+                    'width': w, 'height': h,
+                    'file_size': os.path.getsize(output_path),
+                    'megapixels': megapixels,
+                    'file_path': output_path,
+                    'split_status': 'success',
+                    'ai_label': item.get("label", ""),
+                })
+                success_count += 1
+
+            return success_count, split_details
+
+        except Exception as e:
+            self.logger.warning(f"AI 拆分异常: {image_path} - {e}")
+            return 0, []
+
     def robust_auto_split(self, image_path, output_dir, failed_splits_dir):
         """
-        健壮的自动分割方法 - 结合多种检测方法。
-        优先选轮廓检测（已含框合并），投影分析作为补充。
-        不再盲目做固定网格切割，避免切碎完整图表。
+        健壮的自动分割方法。
+        如果配置了 AI，优先用 AI 检测；AI 失败或无配置时降级为 CV 算法。
         """
+        # ---- AI 优先 ----
+        if self.ai_splitter:
+            ai_count, ai_details = self.ai_split_image(image_path, output_dir)
+            if ai_count >= 1:
+                self.logger.info(f"AI 拆分成功: {os.path.basename(image_path)} -> {ai_count} 个子图")
+                return ai_count, ai_details
+            self.logger.info(f"AI 未检测到多子图，降级 CV: {os.path.basename(image_path)}")
+
+        # ---- CV 降级 ----
         contour_dir = output_dir + "_contour"
         projection_dir = output_dir + "_projection"
 
@@ -703,7 +793,6 @@ class PDFImageProcessor:
                 shutil.copytree(chosen_dir, output_dir)
                 return chosen_count, chosen_details
 
-            # 所有自动方法都没有找到 >=2 个有效子图，保存原图
             return self.save_original_as_fallback(image_path, output_dir, failed_splits_dir)
 
         finally:
@@ -1127,7 +1216,8 @@ class PDFImageProcessor:
 def simple_complete_process(pdf_folder, output_base_folder="processed_pdf_images",
                             min_width=100, min_height=100, min_area=10000, max_aspect_ratio=10,
                             min_file_size=1024, max_file_size=50 * 1024 * 1024, min_megapixels=0.1,
-                            max_workers=4):
+                            max_workers=4,
+                            ai_provider=None, ai_api_key=None, ai_model=None, ai_base_url=None):
     """
     简单完整处理函数
 
@@ -1142,6 +1232,10 @@ def simple_complete_process(pdf_folder, output_base_folder="processed_pdf_images
         max_file_size: 最大文件大小（字节，默认50MB）
         min_megapixels: 最小百万像素分辨率（默认0.1MP）
         max_workers: 并行工作数
+        ai_provider: AI 供应商 (openai/claude/qwen/zhipu)
+        ai_api_key: AI API 密钥
+        ai_model: AI 模型名（可选）
+        ai_base_url: AI API 地址（可选）
     """
     processor = PDFImageProcessor(
         output_base_folder,
@@ -1151,7 +1245,11 @@ def simple_complete_process(pdf_folder, output_base_folder="processed_pdf_images
         max_aspect_ratio=max_aspect_ratio,
         min_file_size=min_file_size,
         max_file_size=max_file_size,
-        min_megapixels=min_megapixels
+        min_megapixels=min_megapixels,
+        ai_provider=ai_provider,
+        ai_api_key=ai_api_key,
+        ai_model=ai_model,
+        ai_base_url=ai_base_url,
     )
     processor.batch_process_pdfs(pdf_folder, max_workers=max_workers)
 
@@ -1177,11 +1275,21 @@ if __name__ == "__main__":
     parser.add_argument("--min-megapixels", type=float, default=0.05, help="最小百万像素 (默认: 0.05)")
     parser.add_argument("--workers", type=int, default=4, help="并行工作线程数 (默认: 4)")
 
+    ai_group = parser.add_argument_group("AI 拆分选项（可选，不传则纯 CV 模式）")
+    ai_group.add_argument("--ai-provider", choices=["openai", "claude", "qwen", "zhipu"],
+                          help="AI 供应商")
+    ai_group.add_argument("--ai-api-key", help="AI API 密钥（也可通过 AI_API_KEY 环境变量设置）")
+    ai_group.add_argument("--ai-model", help="AI 模型名（可选，有默认值）")
+    ai_group.add_argument("--ai-base-url", help="AI API 地址（可选，有默认值）")
+
     args = parser.parse_args()
 
     if not os.path.exists(args.pdf_path):
         print(f"路径不存在: {args.pdf_path}")
         exit(1)
+
+    ai_key = args.ai_api_key or os.environ.get("AI_API_KEY")
+    ai_provider = args.ai_provider or os.environ.get("AI_PROVIDER")
 
     simple_complete_process(
         args.pdf_path,
@@ -1194,4 +1302,8 @@ if __name__ == "__main__":
         max_file_size=args.max_file_size,
         min_megapixels=args.min_megapixels,
         max_workers=args.workers,
+        ai_provider=ai_provider,
+        ai_api_key=ai_key,
+        ai_model=args.ai_model or os.environ.get("AI_MODEL"),
+        ai_base_url=args.ai_base_url or os.environ.get("AI_BASE_URL"),
     )

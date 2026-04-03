@@ -13,6 +13,9 @@ __pycache__/
 *.swp
 *~
 
+# Environment secrets
+.env
+
 # OS metadata
 Thumbs.db
 Desktop.ini
